@@ -2,19 +2,129 @@
 import asyncio
 import datetime
 import json
-import os
-import schemas
-from cookie import suno_auth
-from deps import get_token
-from fastapi import FastAPI, HTTPException, status, Depends, Request, Cookie
-from fastapi.middleware.cors import CORSMiddleware
-from init_sql import create_database_and_table
-from starlette.responses import StreamingResponse
-from suno.suno import SongsGen
-from utils import generate_music, get_feed
-from utils import generate_music, get_feed, generate_lyrics, get_lyrics
+import time
+import warnings
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
-app = FastAPI()
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from fastapi import FastAPI, HTTPException, Query
+from fastapi import Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.responses import StreamingResponse
+
+from data import schemas
+from data.message import response_async
+from process import process_cookies
+from util.config import (SQL_IP, SQL_DK, USER_NAME,
+                         SQL_PASSWORD, SQL_NAME, COOKIES_PREFIX,
+                         BATCH_SIZE, AUTH_KEY)
+from util.logger import logger
+from util.sql_uilts import DatabaseManager
+from util.tool import generate_random_string_async, generate_timestamp_async
+
+warnings.filterwarnings("ignore")
+
+# 从环境变量中获取配置
+db_manager = DatabaseManager(SQL_IP, int(SQL_DK), USER_NAME, SQL_PASSWORD, SQL_NAME)
+process_cookie = process_cookies.processCookies(SQL_IP, int(SQL_DK), USER_NAME, SQL_PASSWORD, SQL_NAME)
+
+
+# executor = ThreadPoolExecutor(max_workers=300, thread_name_prefix="Music_thread")
+
+
+# 刷新cookies函数
+async def cron_refresh_cookies():
+    try:
+        logger.info(f"==========================================")
+        logger.info("开始刷新数据库里的 cookies.........")
+        cookies = [item['cookie'] for item in await db_manager.get_cookies()]
+        total_cookies = len(cookies)
+
+        processed_count = 0
+        for i in range(0, total_cookies, BATCH_SIZE):
+            cookie_batch = cookies[i:i + BATCH_SIZE]
+            for result in process_cookie.refresh_add_cookie(cookie_batch, BATCH_SIZE, False):
+                if result:
+                    processed_count += 1
+
+        success_percentage = (processed_count / total_cookies) * 100 if total_cookies > 0 else 100
+        logger.info(f"所有 Cookies 刷新完毕。{processed_count}/{total_cookies} 个成功，"
+                    f"成功率：({success_percentage:.2f}%)")
+
+    except Exception as e:
+        logger.error({"刷新 cookies 出现错误": str(e)})
+
+
+# 删除无效cookies
+async def cron_delete_cookies():
+    try:
+        logger.info("开始删除数据库里的无效cookies.........")
+        cookies = [item['cookie'] for item in await db_manager.get_invalid_cookies()]
+        delete_tasks = []
+        for cookie in cookies:
+            delete_tasks.append(db_manager.delete_cookies(cookie))
+
+        results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+        success_count = sum(1 for result in results if result is True)
+        fail_count = len(cookies) - success_count
+
+        logger.info(
+            {"message": "无效的 Cookies 删除成功。", "成功数量": success_count, "失败数量": fail_count})
+        logger.info(f"==========================================")
+
+    except Exception as e:
+        logger.error({"删除无效 cookies 出现错误": e})
+
+
+# 先刷新在删除cookies
+async def cron_optimize_cookies():
+    await cron_refresh_cookies()
+    await cron_delete_cookies()
+
+
+# 初始化所有songID
+async def init_delete_songID():
+    try:
+        rows_updated = await db_manager.delete_songIDS()
+        logger.info({"message": "Cookies songIDs 更新成功！", "rows_updated": rows_updated})
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+
+
+# 生命周期管理
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator:
+    global db_manager
+    try:
+        await db_manager.create_pool()
+        await db_manager.create_database_and_table()
+        await init_delete_songID()
+        logger.info("初始化 SQL 和 songID 成功！")
+    except Exception as e:
+        logger.error(f"初始化 SQL 或者 songID 失败: {str(e)}")
+        raise
+
+    # 初始化并启动 APScheduler
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(cron_optimize_cookies, IntervalTrigger(minutes=60), id='Refresh_and_delete_run')
+    scheduler.start()
+
+    try:
+        yield
+    finally:
+        # 停止调度器
+        scheduler.shutdown(wait=True)
+        # 关闭数据库连接池
+        await db_manager.close_db_pool()
+
+
+# FastAPI 应用初始化
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,308 +140,253 @@ async def get_root():
     return schemas.Response()
 
 
-# @app.post("/generate")
-# async def generate(data: schemas.GenerateBase):
-#     cookie = data.dict().get('cookie')
-#     session_id = data.dict().get('session_id')
-#     token = data.dict().get('token')
-#     try:
-#         suno_auth.set_session_id(session_id)
-#         suno_auth.load_cookie(cookie)
-#         resp = await generate_music(data.dict(), token)
-#         return resp
-#     except Exception as e:
-#         raise HTTPException(detail=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-#
-#
-# @app.get("/feed/{aid}")
-# async def fetch_feed(aid: str, token: str = Depends(get_token)):
-#     try:
-#         resp = await get_feed(aid, token)
-#         return resp
-#     except Exception as e:
-#         raise HTTPException(detail=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-#
-#
-# @app.post("/generate/lyrics/")
-# async def generate_lyrics_post(request: Request, token: str = Depends(get_token)):
-#     req = await request.json()
-#     prompt = req.get("prompt")
-#     if prompt is None:
-#         raise HTTPException(detail="prompt is required", status_code=status.HTTP_400_BAD_REQUEST)
-#
-#     try:
-#         resp = await generate_lyrics(prompt, token)
-#         return resp
-#     except Exception as e:
-#         raise HTTPException(detail=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-#
-#
-# @app.get("/lyrics/{lid}")
-# async def fetch_lyrics(lid: str, token: str = Depends(get_token)):
-#     try:
-#         resp = await get_lyrics(lid, token)
-#         return resp
-#     except Exception as e:
-#         raise HTTPException(detail=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-import asyncio
-import random
-import string
-import time
-from sql_uilts import DatabaseManager
-
-BASE_URL = os.getenv('BASE_URL', 'https://studio-api.suno.ai')
-SESSION_ID = os.getenv('SESSION_ID')
-username_name = os.getenv('USER_Name','')
-SQL_name = os.getenv('SQL_name', '')
-SQL_password = os.getenv('SQL_password', '')
-SQL_IP = os.getenv('SQL_IP', '')
-SQL_dk = os.getenv('SQL_dk', 3306)
-
-
-def generate_random_string_async(length):
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
-
-
-def generate_timestamp_async():
-    return int(time.time())
-
-
-import tiktoken
-
-
-def calculate_token_costs(input_prompt: str, output_prompt: str, model_name: str) -> (int, int):
-    """
-    Calculate the number of tokens for the input and output prompts based on the specified model.
-
-    Parameters:
-    input_prompt (str): The input prompt string.
-    output_prompt (str): The output prompt string.
-    model_name (str): The model name to determine the encoding.
-
-    Returns:
-    tuple: A tuple containing the number of tokens for the input prompt and the output prompt.
-    """
-    # Load the correct encoding for the given model
-    encoding = tiktoken.encoding_for_model(model_name)
-
-    # Encode the prompts
-    input_tokens = encoding.encode(input_prompt)
-    output_tokens = encoding.encode(output_prompt)
-
-    # Count the tokens
-    input_token_count = len(input_tokens)
-    output_token_count = len(output_tokens)
-
-    return input_token_count, output_token_count
-
-
-async def generate_data(chat_user_message, chat_id, timeStamp, ModelVersion):
-    db_manager = DatabaseManager(SQL_IP, int(SQL_dk), username_name, SQL_password, SQL_name)
-
-    while True:
-        try:
-            await db_manager.create_pool()
-            cookie = await db_manager.get_non_working_cookie()
-            break
-        except:
-            await create_database_and_table()
-    try:
-        _return_ids = False
-        _return_tags = False
-        _return_title = False
-        _return_prompt = False
-        _return_image_url = False
-        _return_video_url = False
-
-        await db_manager.update_cookie_working(cookie, True)
-        await db_manager.update_cookie_count(cookie, 1)
-
-        token, sid = SongsGen(cookie)._get_auth_token(w=1)
-        suno_auth.set_session_id(sid)
-        suno_auth.load_cookie(cookie)
-        Model = "chirp-v3-0"
-        if ModelVersion == "suno-v3":
-            Model = "chirp-v3-0"
-        elif ModelVersion == "suno-v3.5":
-            Model = "chirp-v3-5"
-        else:
-            yield f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": str("请选择suno-v3 或者 suno-v3.5其中一个")}, "finish_reason": None}]})}\n\n"""
-            yield f"""data:""" + ' ' + f"""[DONE]\n\n"""
-        data = {
-            "gpt_description_prompt": f"{chat_user_message}",
-            "prompt": "",
-            "mv": Model,
-            "title": "",
-            "tags": ""
-        }
-        yield f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})}\n\n"""
-        response = await generate_music(data=data, token=token)
-        await asyncio.sleep(3)
-        while True:
-            try:
-                response_clips = response["clips"]
-                clip_ids = [clip["id"] for clip in response_clips]
-                if not clip_ids:
-                    return
-                break
-            except:
-                pass
-
-        # 使用 clip_ids 查询音频链接
-        for clip_id in clip_ids:
-            attempts = 0
-            while attempts < 120:  # 限制尝试次数以避免无限循环
-                now_data = await get_feed(ids=clip_id, token=token)
-                more_information_ = now_data[0]['metadata']
-                if type(now_data) == dict:
-                    if now_data.get('detail') == 'Unauthorized':
-                        link = f'https://audiopipe.suno.ai/?item_id={clip_id}'
-                        link_data = f"\n **音乐链接**:{link}\n"
-                        yield """data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": link_data}, "finish_reason": None}]})}\n\n"""
-                        break
-
-                elif not _return_ids:
-                    try:
-                        song_id_1 = clip_ids[0]
-                        song_id_2 = clip_ids[1]
-                        song_id_text = (f""
-                                        f"## ⭐ 歌曲ID\n"
-                                        f"- **🎵 歌曲id1️⃣**：{song_id_1}\n"
-                                        f"- **🎵 歌曲id2️⃣**：{song_id_2}\n"
-                                        f"## 🎖️ 歌曲链接: \n"
-                                        f"- 🎵 歌曲1️⃣：{'https://cdn1.suno.ai/' + song_id_1 + '.mp3'} \n"
-                                        f"- 🎵 歌曲2️⃣：{'https://cdn1.suno.ai/' + song_id_2 + '.mp3'} \n"
-                                        f"- ⚠️ 歌曲链接至少要两分钟才生效哦🥰  \n")
-                        yield str(
-                            f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": song_id_text}, "finish_reason": None}]})}\n\n""")
-
-                        _return_ids = True
-                    except:
-                        pass
-
-                if not _return_title:
-                    try:
-                        title = now_data[0]["title"]
-                        if title != '':
-                            title_data = f"## 🧩 歌曲信息\n- **🔎 歌名**：{title} \n"
-                            yield """data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": title_data}, "finish_reason": None}]})}\n\n"""
-                            _return_title = True
-                    except:
-                        pass
-                if not _return_tags:
-                    try:
-                        tags = more_information_["tags"]
-                        if tags is not None:
-                            tags_data = f"- **💄 类型**：{tags} \n"
-                            yield str(
-                                f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": tags_data}, "finish_reason": None}]})}\n\n""")
-                            _return_tags = True
-                    except:
-                        pass
-                if not _return_prompt:
-                    try:
-                        prompt = more_information_["prompt"]
-                        if prompt is not None:
-                            prompt_data = f"## 🎼 完整歌词\n```\n{prompt}\n```\n"
-                            yield str(
-                                f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": prompt_data}, "finish_reason": None}]})}\n\n""")
-                            _return_prompt = True
-                    except:
-                        pass
-
-
-                if not _return_image_url:
-                    if now_data[0].get('image_url') is not None:
-                        image_url_small_data = f"## ✨ 歌曲图片\n**🖼️ 图片链接①** ![封面图片_小]({now_data[0]['image_url']}) \n"
-                        image_url_lager_data = f"**🖼️ 图片链接②** ![封面图片_大]({now_data[0]['image_large_url']}) \n"
-                        yield f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": image_url_small_data}, "finish_reason": None}]})}\n\n"""
-                        yield f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": image_url_lager_data}, "finish_reason": None}]})}\n\n"""
-                        _return_image_url = True
-                if 'audio_url' in now_data[0]:
-                    audio_url_ = now_data[0]['audio_url']
-                    if audio_url_ != '':
-                        audio_url_data = f"\n **📌 音乐链接(临时)**：{audio_url_}"
-                        yield f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": audio_url_data}, "finish_reason": None}]})}\n\n"""
-                        break
-                else:
-                    content_wait = "."
-                    yield f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": content_wait}, "finish_reason": None}]})}\n\n"""
-                    print(attempts)
-                    print(now_data)
-                    time.sleep(5)  # 等待5秒再次尝试
-                    attempts += 1
-        yield f"""data:""" + ' ' + f"""[DONE]\n\n"""
-    except Exception as e:
-        yield f"""data:""" + ' ' + f"""{json.dumps({"id": f"chatcmpl-{chat_id}", "object": "chat.completion.chunk", "model": "suno-v3", "created": timeStamp, "choices": [{"index": 0, "delta": {"content": str(e)}, "finish_reason": None}]})}\n\n"""
-        yield f"""data:""" + ' ' + f"""[DONE]\n\n"""
-    finally:
-        try:
-            await db_manager.update_cookie_working(cookie, False)
-        except:
-            print('No sql')
-
-
 @app.post("/v1/chat/completions")
-async def get_last_user_message(data: schemas.Data):
+async def get_last_user_message(data: schemas.Data, authorization: str = Header(...)):
+    start_time = time.time()
     content_all = ''
-    if SQL_IP == '' or SQL_password == '' or SQL_name == '':
+    if SQL_IP == '' or SQL_PASSWORD == '' or SQL_NAME == '':
         raise ValueError("BASE_URL is not set")
-    else:
+
+    try:
+        await verify_auth_header(authorization)
+    except HTTPException as http_exc:
+        raise http_exc
+
+    try:
         chat_id = generate_random_string_async(29)
         timeStamp = generate_timestamp_async()
-        last_user_content = None
-        for message in reversed(data.messages):
-            if message.role == "user":
-                last_user_content = message.content
-                break
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"生成聊天 ID 或时间戳时出错: {str(e)}")
 
-        if last_user_content is None:
-            raise HTTPException(status_code=400, detail="No user message found")
-        headers = {
-            'Cache-Control': 'no-cache',
-            'Content-Type': 'text/event-stream',
-            'Date': datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT'),
-            'Server': 'uvicorn',
-            'X-Accel-Buffering': 'no',
-            'Transfer-Encoding': 'chunked'
-        }
+    last_user_content = None
+    for message in reversed(data.messages):
+        if message.role == "user":
+            last_user_content = message.content
+            break
 
-        if not data.stream:
-            async for data_string in generate_data(last_user_content, chat_id, timeStamp):
-                try:
-                    json_data = data_string.split('data: ')[1].strip()
+    if last_user_content is None:
+        raise HTTPException(status_code=400, detail="No user message found")
 
-                    parsed_data = json.loads(json_data)
-                    content = parsed_data['choices'][0]['delta']['content']
-                    content_all += content
-                except:
-                    pass
-            input_tokens, output_tokens = calculate_token_costs(last_user_content, content_all, 'gpt-3.5-turbo')
-            json_string = {
-                "id": f"chatcmpl-{chat_id}",
-                "object": "chat.completion",
-                "created": timeStamp,
-                "model": "suno-v3",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": content_all
-                        },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": input_tokens,
-                    "completion_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens
+    headers = {
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'text/event-stream',
+        'Date': datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT'),
+        'Server': 'uvicorn',
+        'X-Accel-Buffering': 'no',
+        'Transfer-Encoding': 'chunked'
+    }
+
+    try:
+        # 协程处理
+        return await response_async(start_time, db_manager, data, content_all,
+                                    chat_id, timeStamp, last_user_content, headers)
+    except HTTPException as http_exc:
+        raise http_exc
+
+    # 线程处理
+    # try:
+    #     future = executor.submit(start_time, request_chat, db_manager, data, content_all, chat_id, timeStamp,
+    #                              last_user_content, headers)
+    #     return future.result()
+    # except Exception as e:
+    #     raise HTTPException(status_code=500, detail=str(e))
+
+
+# 授权检查
+async def verify_auth_header(authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
+    if authorization.strip() != f"Bearer {AUTH_KEY}":
+        raise HTTPException(status_code=403, detail="Invalid authorization key")
+
+
+# 获取cookies的详细详细
+@app.post(f"/{COOKIES_PREFIX}/cookies")
+async def get_cookies(authorization: str = Header(...), cookies_type: str = Query(None)):
+    try:
+        await verify_auth_header(authorization)
+
+        if cookies_type == "list":
+            cookies = await db_manager.get_row_cookies()
+            return JSONResponse(
+                content={
+                    "cookies": cookies
                 }
-            }
-
-            return json_string
+            )
         else:
-            return StreamingResponse(generate_data(last_user_content, chat_id, timeStamp, data.model), headers=headers,
-                                     media_type="text/event-stream")
+            cookies = await db_manager.get_all_cookies()
+            cookies_json = json.loads(cookies)
+            valid_cookie_count = int(await db_manager.get_valid_cookies_count())
+            invalid_cookie_count = len(cookies_json) - valid_cookie_count
+            remaining_count = int(await db_manager.get_cookies_count())
+
+            if remaining_count is None:
+                remaining_count = 0
+
+            logger.info({"message": "Cookies 获取成功。", "数量": len(cookies_json)})
+            logger.info("有效数量: " + str(valid_cookie_count))
+            logger.info("无效数量: " + str(invalid_cookie_count))
+            logger.info("剩余创作音乐次数: " + str(remaining_count))
+
+            return JSONResponse(
+                content={
+                    "cookie_count": len(cookies_json),
+                    "valid_cookie_count": valid_cookie_count,
+                    "invalid_cookie_count": invalid_cookie_count,
+                    "remaining_count": remaining_count,
+                    "process": cookies_json
+                }
+            )
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.put(f"/{COOKIES_PREFIX}/cookies")
+async def add_cookies(data: schemas.Cookies, authorization: str = Header(...)):
+    try:
+        await verify_auth_header(authorization)
+        logger.info(f"==========================================")
+        logger.info("开始添加数据库里的 cookies.........")
+        cookies = data.cookies
+        total_cookies = len(cookies)
+
+        async def stream_results(cookies,total_cookies):
+            processed_count = 0
+            for i in range(0, total_cookies, BATCH_SIZE):
+                cookie_batch = cookies[i:i + BATCH_SIZE]
+                for result in process_cookie.refresh_add_cookie(cookie_batch, BATCH_SIZE, False):
+                    if result:
+                        processed_count += 1
+                        # yield f"data: Cookie {processed_count}/{total_cookies} 添加成功!\n\n"
+                    else:
+                        logger.info(f"data: Cookie {processed_count}/{total_cookies} 添加失败!\n\n")
+                        # yield f"data: Cookie {processed_count}/{total_cookies} 添加失败!\n\n"
+
+            success_percentage = (processed_count / total_cookies) * 100 if total_cookies > 0 else 100
+            logger.info(f"所有 Cookies 添加完毕。{processed_count}/{total_cookies} 个成功，"
+                        f"成功率：({success_percentage:.2f}%)")
+            logger.info(f"==========================================")
+            # yield f"data: 所有 Cookies 添加完毕。{processed_count}/{total_cookies} 个成功，成功率：({success_percentage:.2f}%)\n\n"
+            # yield f"""data:""" + ' ' + f"""[DONE]\n\n"""
+            return f"所有 Cookies 添加完毕。{processed_count}/{total_cookies} 个成功，成功率：({success_percentage:.2f}%)"
+
+        # return StreamingResponse(stream_results(cookies,total_cookies), media_type="text/event-stream")
+        # return JSONResponse({"message":stream_results(cookies,total_cookies)},status_code=200)
+        messageResult = await stream_results(cookies, total_cookies)
+        return JSONResponse({"messages":messageResult},status_code=200)
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error({"添加cookies出现错误": str(e)})
+        return JSONResponse(status_code=500, content={"添加cookies出现错误": str(e)})
+
+
+# 删除cookie
+@app.delete(f"/{COOKIES_PREFIX}/cookies")
+async def delete_cookies(data: schemas.Cookies, authorization: str = Header(...)):
+    try:
+        await verify_auth_header(authorization)
+        cookies = data.cookies
+        delete_tasks = []
+        for cookie in cookies:
+            delete_tasks.append(db_manager.delete_cookies(cookie))
+
+        results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+        success_count = sum(1 for result in results if result is True)
+        fail_count = len(cookies) - success_count
+
+        return JSONResponse(
+            content={"message": "Cookies 成功删除！", "success_count": success_count,
+                     "fail_count": fail_count})
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": e})
+
+
+# 请求刷新cookies
+@app.get(f"/{COOKIES_PREFIX}/refresh/cookies")
+async def refresh_cookies(authorization: str = Header(...)):
+    try:
+        await verify_auth_header(authorization)
+        logger.info(f"==========================================")
+        logger.info("开始刷新数据库里的 cookies.........")
+        cookies = [item['cookie'] for item in await db_manager.get_cookies()]
+        total_cookies = len(cookies)
+
+        async def stream_results():
+            processed_count = 0
+            for i in range(0, total_cookies, BATCH_SIZE):
+                cookie_batch = cookies[i:i + BATCH_SIZE]
+                for result in process_cookie.refresh_add_cookie(cookie_batch, BATCH_SIZE, False):
+                    if result:
+                        processed_count += 1
+                        # yield f"data: Cookie {processed_count}/{total_cookies} 刷新成功!\n\n"
+                    else:
+                        # yield f"data: Cookie {processed_count}/{total_cookies} 刷新失败!\n\n"
+                        logger.info(f"data: Cookie {processed_count}/{total_cookies} 刷新失败!\n\n")
+            success_percentage = (processed_count / total_cookies) * 100 if total_cookies > 0 else 100
+            logger.info(f"所有 Cookies 刷新完毕。{processed_count}/{total_cookies} 个成功，"
+                        f"成功率：({success_percentage:.2f}%)")
+            logger.info(f"==========================================")
+            # yield f"data: 所有 Cookies 刷新完毕。{processed_count}/{total_cookies} 个成功，成功率：({success_percentage:.2f}%)\n\n"
+            # yield f"""data:""" + ' ' + f"""[DONE]\n\n"""
+            return f"data: 所有 Cookies 刷新完毕。{processed_count}/{total_cookies} 个成功，成功率：({success_percentage:.2f}%)\n\n"
+
+
+        messgaesResultRefresh = await stream_results()
+        # return StreamingResponse(stream_results(), media_type="text/event-stream")
+        return JSONResponse({"messages":messgaesResultRefresh},status_code=200)
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error({"刷新cookies出现错误": str(e)})
+        return JSONResponse(status_code=500, content={"刷新cookies出现错误": str(e)})
+
+
+# 删除cookie
+@app.delete(f"/{COOKIES_PREFIX}/refresh/cookies")
+async def delete_invalid_cookies(authorization: str = Header(...)):
+    try:
+        await verify_auth_header(authorization)
+        logger.info(f"==========================================")
+        logger.info("开始删除数据库里的无效cookies.........")
+        cookies = [item['cookie'] for item in await db_manager.get_invalid_cookies()]
+        delete_tasks = []
+        for cookie in cookies:
+            delete_tasks.append(db_manager.delete_cookies(cookie))
+
+        results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+        success_count = sum(1 for result in results if result is True)
+        fail_count = len(cookies) - success_count
+
+        logger.info(
+            {"message": "Invalid cookies 删除成功。", "成功数量": success_count, "失败数量": fail_count})
+        logger.info(f"==========================================")
+        return JSONResponse(
+            content={"message": "无效的cookies删除成功！", "success_count": success_count,
+                     "fail_count": fail_count})
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": e})
+
+
+# 获取cookies的详细详细
+@app.delete(f"/{COOKIES_PREFIX}/songID/cookies")
+async def delete_songID(authorization: str = Header(...)):
+    try:
+        await verify_auth_header(authorization)
+        rows_updated = await db_manager.delete_songIDS()
+        return JSONResponse(
+            content={"message": "Cookies songIDs 更新成功！", "rows_updated": rows_updated}
+        )
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
